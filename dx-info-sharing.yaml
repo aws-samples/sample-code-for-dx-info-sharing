@@ -1,0 +1,304 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Direct Connect Information Sharing Framework v6.2.14 — Cross-Account IAM Role.
+  Deploys a least-privilege, read-only IAM role that enables a WAN Service Provider
+  (WSP) or Enterprise Service Provider (ESP) to access Direct Connect telemetry,
+  CloudWatch metrics, and tag-based resource metadata via the Resource Groups
+  Tagging API. Namespace scoping for CloudWatch is implemented operationally by
+  the monitoring system. AWS Config compliance read access is optional.
+  AWS Partition-independent (aws, aws-us-gov, aws-eusc, aws-iso, aws-iso-b, ...).
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Required — ESP/WSP Configuration
+        Parameters:
+          - ESPAccountId
+          - ExternalId
+      - Label:
+          default: Optional — Permission Toggles
+        Parameters:
+          - EnableExternalId
+          - EnableVPCAccess
+          - EnableTGWAccess
+          - EnableConfigAccess
+      - Label:
+          default: Optional — Resource Naming
+        Parameters:
+          - RoleName
+          - PolicyName
+    ParameterLabels:
+      ESPAccountId:
+        default: ESP/WSP AWS Account ID
+      ExternalId:
+        default: External ID for Role Assumption
+      EnableExternalId:
+        default: Enforce ExternalId in Trust Policy
+      EnableVPCAccess:
+        default: Enable VPC Peering Information Access
+      EnableTGWAccess:
+        default: Enable Transit Gateway Information Access
+      EnableConfigAccess:
+        default: Enable AWS Config Compliance Read Access
+      RoleName:
+        default: IAM Role Name
+      PolicyName:
+        default: IAM Policy Name
+
+Parameters:
+  ESPAccountId:
+    Type: String
+    Description: >
+      The 12-digit AWS account ID of the Enterprise Service Provider (ESP) or
+      WAN Service Provider (WSP) that will assume this role.
+    AllowedPattern: '^\d{12}$'
+    ConstraintDescription: Must be a valid 12-digit AWS account ID.
+
+  ExternalId:
+    Type: String
+    Description: >
+      A unique external ID shared between the customer and ESP/WSP. Used to prevent
+      confused deputy attacks. Recommended: use a UUID. Share via secure channel only.
+    MinLength: 8
+    MaxLength: 256
+    NoEcho: true
+
+  EnableExternalId:
+    Type: String
+    Description: >
+      Enable ExternalId enforcement in the trust policy (Deployment Model A).
+      When 'true', the trust policy requires the caller to provide the correct
+      ExternalId during sts:AssumeRole. This prevents confused deputy attacks
+      but disables AWS Console Switch Role. When 'false' (Deployment Model B),
+      Console role switching is supported but confused deputy mitigation depends
+      on tightly scoped Principal and CloudTrail monitoring.
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  EnableVPCAccess:
+    Type: String
+    Description: Enable optional read-only access to VPC peering and routing information.
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  EnableTGWAccess:
+    Type: String
+    Description: Enable optional read-only access to Transit Gateway information.
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  EnableConfigAccess:
+    Type: String
+    Description: >
+      Enable optional read-only access to AWS Config compliance data. Enable only
+      if customer uses AWS Config governance controls for Direct Connect resources.
+      AWS Config support for Direct Connect resource types varies by Region and partition.
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  RoleName:
+    Type: String
+    Description: Name for the IAM role.
+    Default: DXNetworkOperatorRole
+    AllowedPattern: '^[\w+=,.@-]{1,64}$'
+    ConstraintDescription: Must be a valid IAM role name (1-64 characters).
+
+  PolicyName:
+    Type: String
+    Description: Name for the IAM managed policy.
+    Default: DXNetworkOperatorPolicy
+    AllowedPattern: '^[\w+=,.@-]{1,128}$'
+    ConstraintDescription: Must be a valid IAM policy name (1-128 characters).
+
+Conditions:
+  ExternalIdEnabled: !Equals [!Ref EnableExternalId, 'true']
+  VPCAccessEnabled: !Equals [!Ref EnableVPCAccess, 'true']
+  TGWAccessEnabled: !Equals [!Ref EnableTGWAccess, 'true']
+  ConfigAccessEnabled: !Equals [!Ref EnableConfigAccess, 'true']
+
+Resources:
+  # ---------------------------------------------------------------
+  # IAM Managed Policy: DXNetworkOperatorPolicy
+  # ---------------------------------------------------------------
+  DXNetworkOperatorPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Ref PolicyName
+      Description: >-
+        Read-only access to Direct Connect resources, CloudWatch metrics,
+        IAM role self-audit, and tag-based resource discovery via the
+        Resource Groups Tagging API. The monitoring system should scope
+        CloudWatch queries to the AWS/DX namespace operationally.
+        AWS Config compliance read access is included only if
+        EnableConfigAccess is true. No write permissions are granted.
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          # --- Statement 1: Direct Connect Read-Only ---
+          - Sid: DirectConnectReadOnly
+            Effect: Allow
+            Action:
+              - 'directconnect:Describe*'
+              - 'directconnect:List*'
+            Resource: '*'
+
+          # --- Statement 2: CloudWatch Metrics Read (No Namespace Condition) ---
+          # The cloudwatch:namespace condition key is not listed in the
+          # CloudWatch Service Authorization Reference as applicable to
+          # GetMetricData, GetMetricStatistics, or ListMetrics. Namespace
+          # scoping is implemented operationally by the monitoring system
+          # query scope (querying only AWS/DX and optionally AWS/NetworkMonitor).
+          - Sid: CloudWatchMetricsRead
+            Effect: Allow
+            Action:
+              - 'cloudwatch:GetMetricData'
+              - 'cloudwatch:GetMetricStatistics'
+              - 'cloudwatch:ListMetrics'
+            Resource: '*'
+
+          # --- Statement 3: CloudWatch Alarm Discovery (No Namespace Condition) ---
+          # DescribeAlarms and DescribeAlarmsForMetric do not support the
+          # cloudwatch:namespace condition key. They are separated into their
+          # own statement to avoid restricting alarm visibility.
+          - Sid: CloudWatchAlarmDiscovery
+            Effect: Allow
+            Action:
+              - 'cloudwatch:DescribeAlarms'
+              - 'cloudwatch:DescribeAlarmsForMetric'
+            Resource: '*'
+
+          # --- Statement 4: Resource Tag Discovery (No IAM Tag Condition) ---
+          # The Resource Groups Tagging API does not support resource-level
+          # authorization or service-specific condition keys for tag filtering.
+          # Tag scoping is implemented at the API request level via TagFilters
+          # in the WSP/ESP monitoring system, not via IAM conditions.
+          - Sid: TagBasedResourceDiscovery
+            Effect: Allow
+            Action:
+              - 'tag:GetResources'
+              - 'tag:GetTagKeys'
+              - 'tag:GetTagValues'
+            Resource: '*'
+
+          # --- Statement 5a: IAM Role Self-Audit (Scoped to Operator Role) ---
+          # All four actions support resource-level permissions for role ARN
+          # per the IAM Service Authorization Reference.
+          - Sid: IAMRoleSelfAudit
+            Effect: Allow
+            Action:
+              - 'iam:GetRole'
+              - 'iam:GetRolePolicy'
+              - 'iam:ListAttachedRolePolicies'
+              - 'iam:ListRolePolicies'
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${RoleName}'
+
+          # --- Statement 5b: IAM Policy Self-Audit (Scoped to Operator Policy) ---
+          # Both actions support resource-level permissions for policy ARN
+          # per the IAM Service Authorization Reference.
+          - Sid: IAMPolicySelfAudit
+            Effect: Allow
+            Action:
+              - 'iam:GetPolicy'
+              - 'iam:GetPolicyVersion'
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:policy/${PolicyName}'
+
+          # --- Statement 6a: Optional AWS Config Compliance Read ---
+          - !If
+            - ConfigAccessEnabled
+            - Sid: ConfigComplianceRead
+              Effect: Allow
+              Action:
+                - 'config:DescribeConfigRules'
+                - 'config:DescribeComplianceByConfigRule'
+                - 'config:DescribeComplianceByResource'
+                - 'config:GetComplianceDetailsByConfigRule'
+                - 'config:GetComplianceDetailsByResource'
+              Resource: '*'
+            - !Ref 'AWS::NoValue'
+
+          # --- Statement 6b: Optional VPC Peering Information ---
+          - !If
+            - VPCAccessEnabled
+            - Sid: VPCReadOnly
+              Effect: Allow
+              Action:
+                - 'ec2:DescribeVpcs'
+                - 'ec2:DescribeVpcPeeringConnections'
+                - 'ec2:DescribeRouteTables'
+                - 'ec2:DescribeVpnConnections'
+                - 'ec2:DescribeVpnGateways'
+                - 'ec2:DescribeCustomerGateways'
+              Resource: '*'
+            - !Ref 'AWS::NoValue'
+
+          # --- Statement 6c: Optional Transit Gateway Information ---
+          - !If
+            - TGWAccessEnabled
+            - Sid: TGWReadOnly
+              Effect: Allow
+              Action:
+                - 'ec2:DescribeTransitGateways'
+                - 'ec2:DescribeTransitGatewayAttachments'
+                - 'ec2:DescribeTransitGatewayRouteTables'
+                - 'ec2:SearchTransitGatewayRoutes'
+              Resource: '*'
+            - !Ref 'AWS::NoValue'
+
+  # ---------------------------------------------------------------
+  # IAM Role: DXNetworkOperatorRole
+  # ---------------------------------------------------------------
+  DXNetworkOperatorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Ref RoleName
+      Description: >
+        Cross-account role for ESP/WSP network operators to access Direct Connect
+        information for operations and maintenance support. Read-only access only.
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowESPAssumeRole
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:${AWS::Partition}:iam::${ESPAccountId}:root'
+            Action: 'sts:AssumeRole'
+            Condition: !If
+              - ExternalIdEnabled
+              - StringEquals:
+                  'sts:ExternalId': !Ref ExternalId
+              - !Ref 'AWS::NoValue'
+      ManagedPolicyArns:
+        - !Ref DXNetworkOperatorPolicy
+      Tags:
+        - Key: Purpose
+          Value: DXInfoSharing
+        - Key: ManagedBy
+          Value: CloudFormation
+
+Outputs:
+  RoleArn:
+    Description: >
+      ARN of the DXNetworkOperatorRole. Share this with your WSP/ESP so they
+      can configure their monitoring system to assume this role.
+    Value: !GetAtt DXNetworkOperatorRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-RoleArn'
+
+  PolicyArn:
+    Description: ARN of the DXNetworkOperatorPolicy managed policy.
+    Value: !Ref DXNetworkOperatorPolicy
+
+  StackPartition:
+    Description: The AWS partition this stack was deployed in.
+    Value: !Ref 'AWS::Partition'
