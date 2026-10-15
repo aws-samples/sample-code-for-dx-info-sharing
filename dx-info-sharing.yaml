@@ -1,12 +1,16 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >
-  Direct Connect Information Sharing Framework v6.2.14 — Cross-Account IAM Role.
+  Direct Connect Information Sharing Framework v6.2.15 — Cross-Account IAM Role.
   Deploys a least-privilege, read-only IAM role that enables a WAN Service Provider
   (WSP) or Enterprise Service Provider (ESP) to access Direct Connect telemetry,
   CloudWatch metrics, and tag-based resource metadata via the Resource Groups
-  Tagging API. Namespace scoping for CloudWatch is implemented operationally by
-  the monitoring system. AWS Config compliance read access is optional.
-  AWS Partition-independent (aws, aws-us-gov, aws-eusc, aws-iso, aws-iso-b, ...).
+  Tagging API. The trust policy trusts a single ESP/WSP IAM role, requires the
+  ExternalId on every role assumption, and can require a source identity.
+  Namespace scoping for CloudWatch is implemented operationally by the
+  monitoring system. AWS Config compliance read access is optional.
+  Partition-independent (aws, aws-us-gov, aws-iso, aws-iso-b).
 
 Metadata:
   AWS::CloudFormation::Interface:
@@ -15,11 +19,15 @@ Metadata:
           default: Required — ESP/WSP Configuration
         Parameters:
           - ESPAccountId
+          - ESPRoleName
           - ExternalId
+      - Label:
+          default: Optional — Trust Policy Hardening
+        Parameters:
+          - RequireSourceIdentity
       - Label:
           default: Optional — Permission Toggles
         Parameters:
-          - EnableExternalId
           - EnableVPCAccess
           - EnableTGWAccess
           - EnableConfigAccess
@@ -31,10 +39,12 @@ Metadata:
     ParameterLabels:
       ESPAccountId:
         default: ESP/WSP AWS Account ID
+      ESPRoleName:
+        default: ESP/WSP IAM Role Name (Including Path)
       ExternalId:
         default: External ID for Role Assumption
-      EnableExternalId:
-        default: Enforce ExternalId in Trust Policy
+      RequireSourceIdentity:
+        default: Require Source Identity on Role Assumption
       EnableVPCAccess:
         default: Enable VPC Peering Information Access
       EnableTGWAccess:
@@ -55,24 +65,43 @@ Parameters:
     AllowedPattern: '^\d{12}$'
     ConstraintDescription: Must be a valid 12-digit AWS account ID.
 
+  ESPRoleName:
+    Type: String
+    Description: >
+      Name of the IAM role in the ESP/WSP account that is allowed to assume this
+      role. Include the role path if the role has one (for example,
+      DXMonitoringRole or service-role/DXMonitoringRole). Only this role is
+      trusted, not the entire ESP/WSP account. The role must already exist when
+      you create or update this stack.
+    AllowedPattern: '^([\w+=,.@-]+/)*[\w+=,.@-]{1,64}$'
+    ConstraintDescription: >
+      Must be a valid IAM role name (1-64 characters), optionally preceded by the
+      role path without a leading slash (for example, service-role/DXMonitoringRole).
+
   ExternalId:
     Type: String
     Description: >
-      A unique external ID shared between the customer and ESP/WSP. Used to prevent
-      confused deputy attacks. Recommended: use a UUID. Share via secure channel only.
-    MinLength: 8
+      The external ID that the ESP/WSP generated for this customer relationship.
+      The ESP/WSP must generate a unique, random value for each customer (a
+      version 4 UUID is recommended) and pass it on every sts:AssumeRole call.
+      The trust policy rejects role assumption without the matching value, which
+      mitigates the confused deputy problem. Share via secure channel only.
+    MinLength: 32
     MaxLength: 256
+    AllowedPattern: '^[\w+=,.@:/-]+$'
+    ConstraintDescription: >
+      Must be 32-256 characters long and contain only letters, numbers, and
+      the characters _+=,.@:/- (the character set AWS STS accepts for ExternalId).
     NoEcho: true
 
-  EnableExternalId:
+  RequireSourceIdentity:
     Type: String
     Description: >
-      Enable ExternalId enforcement in the trust policy (Deployment Model A).
-      When 'true', the trust policy requires the caller to provide the correct
-      ExternalId during sts:AssumeRole. This prevents confused deputy attacks
-      but disables AWS Console Switch Role. When 'false' (Deployment Model B),
-      Console role switching is supported but confused deputy mitigation depends
-      on tightly scoped Principal and CloudTrail monitoring.
+      Require the ESP/WSP to set a source identity (for example, the operator or
+      monitoring system name) when it assumes this role. AWS STS records the
+      source identity in CloudTrail for every API call in the session, and it
+      cannot be changed for the life of the session. When 'false', a source
+      identity is accepted but not required.
     Default: 'true'
     AllowedValues:
       - 'true'
@@ -120,10 +149,10 @@ Parameters:
     ConstraintDescription: Must be a valid IAM policy name (1-128 characters).
 
 Conditions:
-  ExternalIdEnabled: !Equals [!Ref EnableExternalId, 'true']
   VPCAccessEnabled: !Equals [!Ref EnableVPCAccess, 'true']
   TGWAccessEnabled: !Equals [!Ref EnableTGWAccess, 'true']
   ConfigAccessEnabled: !Equals [!Ref EnableConfigAccess, 'true']
+  SourceIdentityRequired: !Equals [!Ref RequireSourceIdentity, 'true']
 
 Resources:
   # ---------------------------------------------------------------
@@ -268,16 +297,25 @@ Resources:
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
+          # Trusts a single ESP/WSP role (not the account root) and requires the
+          # customer-specific ExternalId on every AssumeRole call to mitigate the
+          # confused deputy problem. sts:SetSourceIdentity lets the caller set a
+          # source identity, or carry one over through role chaining, so that
+          # CloudTrail attributes every action in the session.
           - Sid: AllowESPAssumeRole
             Effect: Allow
             Principal:
-              AWS: !Sub 'arn:${AWS::Partition}:iam::${ESPAccountId}:root'
-            Action: 'sts:AssumeRole'
-            Condition: !If
-              - ExternalIdEnabled
-              - StringEquals:
-                  'sts:ExternalId': !Ref ExternalId
-              - !Ref 'AWS::NoValue'
+              AWS: !Sub 'arn:${AWS::Partition}:iam::${ESPAccountId}:role/${ESPRoleName}'
+            Action:
+              - 'sts:AssumeRole'
+              - 'sts:SetSourceIdentity'
+            Condition:
+              StringEquals:
+                'sts:ExternalId': !Ref ExternalId
+              'Null': !If
+                - SourceIdentityRequired
+                - 'sts:SourceIdentity': 'false'
+                - !Ref 'AWS::NoValue'
       ManagedPolicyArns:
         - !Ref DXNetworkOperatorPolicy
       Tags:
